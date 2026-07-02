@@ -478,5 +478,576 @@ all:
 
 Уточните также:
 - используете **GitLab Runner** с тегом `ansible` или Docker executor?
+
+------------------------------
+
+Режим **Ask** — файлы в репозиторий не добавляю; ниже обновлённая архитектура проекта с учётом Nexus, GitLab Runner на отдельном сервере и собственного Docker-образа Ansible.
+
+---
+
+## Обновлённая структура проекта
+
+```
+linux-os-update/
+├── .gitlab-ci.yml
+├── ansible.cfg
+├── requirements.yml
+├── site.yml
+├── Dockerfile                          # NEW: кастомный образ Ansible
+├── docker/
+│   ├── entrypoint.sh                   # NEW
+│   └── build-push.sh                   # NEW: push в Nexus Docker registry
+├── gitlab-runner/                      # NEW
+│   ├── config.toml.example
+│   ├── install-runner.sh
+│   └── README.md
+├── inventory/
+│   └── production/
+│       ├── hosts.yml
+│       └── group_vars/
+│           ├── all.yml
+│           ├── nexus.yml               # NEW: URL и имена repo в Nexus
+│           ├── ubuntu.yml
+│           └── ol9.yml
+├── roles/
+│   ├── nexus_repo/                     # NEW: настройка apt/dnf → Nexus
+│   ├── pre_check_repos/
+│   ├── pre_check_connectivity/
+│   ├── pre_check_locks/
+│   ├── os_update_ubuntu/
+│   ├── os_update_ol9/
+│   ├── post_update_report/
+│   └── common_logging/
+├── templates/
+│   ├── nexus-ubuntu.list.j2            # NEW
+│   ├── nexus-ol9.repo.j2               # NEW
+│   └── report.html.j2
+├── logs/
+└── reports/
+```
+
+---
+
+## 1. Локальный Nexus с авторизацией
+
+### Nexus: что создать в UI
+
+| Тип | Имя (пример) | Назначение |
+|-----|--------------|------------|
+| apt (proxy/group) | `ubuntu-jammy-group` | Ubuntu 22.04 |
+| yum (proxy/group) | `ol9-baseos-group` | Oracle Linux 9 BaseOS |
+| yum (proxy/group) | `ol9-appstream-group` | OL9 AppStream |
+| docker (hosted) | `docker-ansible` | образ Ansible для CI |
+
+Включите **Authentication** (Username/Password или token) на proxy-репозиториях.
+
+### Переменные (Ansible Vault + GitLab CI)
+
+`inventory/production/group_vars/nexus.yml`:
+
+```yaml
+---
+nexus_host: "nexus.corp.local"
+nexus_port: 8081
+nexus_base_url: "https://{{ nexus_host }}:{{ nexus_port }}/repository"
+
+# Учётные данные — из Vault, не в открытом виде
+nexus_username: "{{ vault_nexus_username }}"
+nexus_password: "{{ vault_nexus_password }}"
+
+# Имена репозиториев в Nexus
+nexus_ubuntu_repo: "ubuntu-jammy-group"
+nexus_ol9_baseos_repo: "ol9-baseos-group"
+nexus_ol9_appstream_repo: "ol9-appstream-group"
+
+# URL для pre-check connectivity
+nexus_repo_urls:
+  ubuntu:
+    - "{{ nexus_base_url }}/{{ nexus_ubuntu_repo }}/"
+  ol9:
+    - "{{ nexus_base_url }}/{{ nexus_ol9_baseos_repo }}/"
+    - "{{ nexus_base_url }}/{{ nexus_ol9_appstream_repo }}/"
+
+nexus_validate_certs: false   # true, если Nexus с доверенным CA
+```
+
+**GitLab CI Variables** (Settings → CI/CD → Variables):
+
+| Variable | Тип | Описание |
+|----------|-----|----------|
+| `VAULT_NEXUS_USERNAME` | Variable, masked | логин Nexus |
+| `VAULT_NEXUS_PASSWORD` | Variable, masked, protected | пароль/token |
+| `ANSIBLE_VAULT_PASSWORD` | Variable, masked, protected | для vault-файлов |
+| `SSH_PRIVATE_KEY` | File/Variable | ключ к целевым серверам |
+
+### Роль `nexus_repo`
+
+**Ubuntu** — `/etc/apt/auth.conf.d/nexus.conf` (рекомендуемый способ, без пароля в URL):
+
+```jinja2
+{# templates/nexus-ubuntu.list.j2 #}
+deb [trusted=yes] {{ nexus_base_url }}/{{ nexus_ubuntu_repo }}/ {{ ansible_distribution_release }} main restricted universe multiverse
+deb [trusted=yes] {{ nexus_base_url }}/{{ nexus_ubuntu_repo }}/ {{ ansible_distribution_release }}-updates main restricted universe multiverse
+deb [trusted=yes] {{ nexus_base_url }}/{{ nexus_ubuntu_repo }}/ {{ ansible_distribution_release }}-security main restricted universe multiverse
+```
+
+```ini
+# templates/nexus-apt-auth.conf.j2
+machine {{ nexus_host }}/repository/{{ nexus_ubuntu_repo }}/
+login {{ nexus_username }}
+password {{ nexus_password }}
+```
+
+**Oracle Linux 9** — username/password в URL или отдельный файл (как в вашем `ans_role_nexus_auth_ol.md`):
+
+```ini
+# templates/nexus-ol9.repo.j2
+[nexus-baseos]
+name=Nexus OL9 BaseOS
+baseurl={{ nexus_base_url }}/{{ nexus_ol9_baseos_repo }}/$releasever/BaseOS/$basearch/os/
+enabled=1
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-oracle
+username={{ nexus_username }}
+password={{ nexus_password }}
+sslverify={{ 0 if not nexus_validate_certs else 1 }}
+
+[nexus-appstream]
+name=Nexus OL9 AppStream
+baseurl={{ nexus_base_url }}/{{ nexus_ol9_appstream_repo }}/$releasever/AppStream/$basearch/os/
+enabled=1
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-oracle
+username={{ nexus_username }}
+password={{ nexus_password }}
+sslverify={{ 0 if not nexus_validate_certs else 1 }}
+```
+
+### Pre-check с Nexus
+
+Обновите `pre_check_repos`:
+- Ubuntu: `grep nexus` в `sources.list.d`, наличие `auth.conf.d/nexus.conf`, `apt-cache policy`
+- OL9: `dnf repolist enabled`, проверка `username=` в `.repo`
+
+Обновите `pre_check_connectivity`:
+
+```yaml
+- name: Check Nexus repo availability (with auth)
+  ansible.builtin.uri:
+    url: "{{ item }}"
+    url_username: "{{ nexus_username }}"
+    url_password: "{{ nexus_password }}"
+    force_basic_auth: true
+    validate_certs: "{{ nexus_validate_certs }}"
+    status_code: [200, 301, 302, 404]
+    timeout: 15
+  loop: "{{ nexus_repo_urls[os_group] }}"
+  register: nexus_check
+  failed_when: nexus_check.status is not defined or nexus_check.status >= 500
+```
+
+В отчёт добавьте: какие Nexus-репозитории проверены, HTTP-код, время ответа.
+
+---
+
+## 2. GitLab Runner на отдельном сервере
+
+Схема:
+
+```
+GitLab Server ──► Runner Server (ansible-runner-01) ──► Target hosts (Ubuntu/OL9)
+                      │
+                      ├── Docker + custom Ansible image (из Nexus)
+                      └── SSH к целевым серверам
+```
+
+### Установка runner (на сервере `ansible-runner-01`)
+
+`gitlab-runner/install-runner.sh`:
+
+```bash
+#!/bin/bash
+set -euo pipefail
+
+GITLAB_URL="https://gitlab.corp.local"
+REGISTRATION_TOKEN="${1:?Usage: $0 <registration_token>}"
+
+curl -L "https://packages.gitlab.com/install/repositories/runner/gitlab-runner/script.deb.sh" | sudo bash
+sudo apt-get install -y gitlab-runner docker.io
+
+sudo usermod -aG docker gitlab-runner
+
+sudo gitlab-runner register \
+  --non-interactive \
+  --url "$GITLAB_URL" \
+  --registration-token "$REGISTRATION_TOKEN" \
+  --executor "docker" \
+  --docker-image "nexus.corp.local:8082/docker-ansible/ansible-os-update:latest" \
+  --description "ansible-os-update-runner" \
+  --tag-list "ansible,os-update,nexus" \
+  --run-untagged="false" \
+  --locked="false" \
+  --docker-privileged="false" \
+  --docker-volumes "/cache" \
+  --docker-volumes "/etc/ssl/certs:/etc/ssl/certs:ro"
+
+sudo systemctl enable --now gitlab-runner docker
+```
+
+### `gitlab-runner/config.toml.example`
+
+```toml
+concurrent = 2
+check_interval = 0
+
+[session_server]
+  session_timeout = 1800
+
+[[runners]]
+  name = "ansible-os-update-runner"
+  url = "https://gitlab.corp.local"
+  token = "RUNNER_TOKEN"
+  executor = "docker"
+  tags = ["ansible", "os-update", "nexus"]
+  [runners.custom_build_dir]
+  [runners.cache]
+    Type = "s3"          # опционально
+  [runners.docker]
+    tls_verify = false
+    image = "nexus.corp.local:8082/docker-ansible/ansible-os-update:latest"
+    privileged = false
+    disable_entrypoint_overwrite = false
+    oom_kill_disable = false
+    disable_cache = false
+    volumes = ["/cache", "/etc/ssl/certs:/etc/ssl/certs:ro"]
+    pull_policy = "if-not-present"
+    shm_size = 0
+    # Доступ к Nexus Docker registry
+    environment = ["DOCKER_AUTH_CONFIG={\"auths\":{\"nexus.corp.local:8082\":{\"auth\":\"BASE64_USER_PASS\"}}}"]
+```
+
+На runner-сервере:
+
+```bash
+# Docker login в Nexus (порт 8082 — docker hosted)
+docker login nexus.corp.local:8082 -u deploy_user -p '***'
+
+# Или /etc/docker/daemon.json — insecure-registries, если HTTP
+```
+
+**Важно:** runner должен иметь сетевой доступ к:
+- GitLab
+- Nexus (`8081` — apt/yum, `8082` — docker)
+- целевым серверам по SSH (22)
+
+---
+
+## 3. Dockerfile и образ Ansible
+
+### `Dockerfile`
+
+```dockerfile
+FROM python:3.12-slim-bookworm
+
+LABEL maintainer="devops@corp.local"
+LABEL description="Ansible image for Linux OS update pipeline"
+
+ENV ANSIBLE_FORCE_COLOR=1 \
+    ANSIBLE_HOST_KEY_CHECKING=False \
+    ANSIBLE_RETRY_FILES_ENABLED=False \
+    ANSIBLE_ROLES_PATH=/ansible/roles \
+    PIP_NO_CACHE_DIR=1 \
+    DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      openssh-client \
+      sshpass \
+      git \
+      ca-certificates \
+      curl \
+      jq \
+      rsync \
+      iputils-ping \
+      dnsutils \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --upgrade pip && pip install \
+      "ansible>=9,<10" \
+      ansible-lint \
+      yamllint \
+      jmespath \
+      netaddr \
+      passlib
+
+WORKDIR /ansible
+
+COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+ENTRYPOINT ["entrypoint.sh"]
+CMD ["ansible-playbook", "--version"]
+```
+
+### `docker/entrypoint.sh`
+
+```bash
+#!/bin/bash
+set -euo pipefail
+
+cd "${CI_PROJECT_DIR:-/ansible}"
+
+# SSH key из GitLab CI
+if [ -n "${SSH_PRIVATE_KEY:-}" ]; then
+  echo "$SSH_PRIVATE_KEY" | tr -d '\r' > /tmp/id_rsa
+  chmod 600 /tmp/id_rsa
+  export ANSIBLE_PRIVATE_KEY_FILE=/tmp/id_rsa
+fi
+
+# Ansible Vault
+if [ -n "${ANSIBLE_VAULT_PASSWORD:-}" ]; then
+  echo "$ANSIBLE_VAULT_PASSWORD" > /tmp/.vault_pass
+  chmod 600 /tmp/.vault_pass
+  export ANSIBLE_VAULT_PASSWORD_FILE=/tmp/.vault_pass
+fi
+
+mkdir -p logs reports
+
+exec "$@"
+```
+
+### Сборка и push в Nexus
+
+`docker/build-push.sh`:
+
+```bash
+#!/bin/bash
+set -euo pipefail
+
+NEXUS_REGISTRY="nexus.corp.local:8082"
+IMAGE_NAME="docker-ansible/ansible-os-update"
+TAG="${1:-latest}"
+
+docker build -t "${NEXUS_REGISTRY}/${IMAGE_NAME}:${TAG}" .
+docker push "${NEXUS_REGISTRY}/${IMAGE_NAME}:${TAG}"
+```
+
+---
+
+## 4. Обновлённый `.gitlab-ci.yml`
+
+```yaml
+spec:
+  inputs:
+    inventory:
+      default: production
+      options: [production, staging]
+    target_hosts:
+      default: "all"
+    run_precheck:
+      type: boolean
+      default: true
+    run_update:
+      type: boolean
+      default: true
+    run_report:
+      type: boolean
+      default: true
+    update_type:
+      default: security
+      options: [security, all]
+    check_mode:
+      type: boolean
+      default: false
+
+stages:
+  - build
+  - validate
+  - precheck
+  - update
+  - report
+
+variables:
+  NEXUS_REGISTRY: "nexus.corp.local:8082"
+  ANSIBLE_IMAGE: "${NEXUS_REGISTRY}/docker-ansible/ansible-os-update:latest"
+  ANSIBLE_FORCE_COLOR: "1"
+
+# Сборка образа (при изменении Dockerfile)
+build_ansible_image:
+  stage: build
+  tags: [ansible, os-update, nexus]
+  image: docker:24-cli
+  services:
+    - name: docker:24-dind
+      command: ["--insecure-registry=nexus.corp.local:8082"]
+  before_script:
+    - echo "$NEXUS_DOCKER_AUTH" | docker login "$NEXUS_REGISTRY" -u "$NEXUS_DOCKER_USER" --password-stdin
+  script:
+    - docker build -t "$ANSIBLE_IMAGE" .
+    - docker push "$ANSIBLE_IMAGE"
+  rules:
+    - changes: [Dockerfile, docker/**, requirements.yml]
+    - if: $BUILD_ANSIBLE_IMAGE == "true"
+      when: manual
+
+.ansible_job:
+  tags: [ansible, os-update, nexus]    # runner на отдельном сервере
+  image:
+    name: $ANSIBLE_IMAGE
+    pull_policy: if-not-present
+  before_script:
+    - ansible --version
+    - mkdir -p logs reports
+    - |
+      ansible-galaxy install -r requirements.yml -p roles 2>/dev/null || true
+    - |
+      if [ -f inventory/$[[ inputs.inventory ]]/group_vars/vault.yml ]; then
+        ansible-vault decrypt inventory/$[[ inputs.inventory ]]/group_vars/vault.yml \
+          --output /tmp/vault_decrypted.yml || true
+      fi
+
+validate:
+  stage: validate
+  extends: .ansible_job
+  script:
+    - ansible-playbook site.yml --syntax-check
+    - ansible-lint site.yml || true
+  rules:
+    - when: always
+
+precheck:
+  stage: precheck
+  extends: .ansible_job
+  script:
+    - |
+      ansible-playbook site.yml \
+        -i inventory/$[[ inputs.inventory ]]/hosts.yml \
+        --limit "$[[ inputs.target_hosts ]]" \
+        --tags "precheck,nexus" \
+        --extra-vars "{
+          run_precheck: $[[ inputs.run_precheck ]],
+          run_update: false,
+          run_report: false,
+          vault_nexus_username: \"${VAULT_NEXUS_USERNAME}\",
+          vault_nexus_password: \"${VAULT_NEXUS_PASSWORD}\"
+        }" \
+        $([[ "$[[ inputs.check_mode ]]" == "true" ]] && echo "--check")
+  artifacts:
+    paths: [logs/, reports/]
+    expire_in: 30 days
+  rules:
+    - when: manual
+
+update:
+  stage: update
+  extends: .ansible_job
+  needs: [precheck]
+  script:
+    - |
+      ansible-playbook site.yml \
+        -i inventory/$[[ inputs.inventory ]]/hosts.yml \
+        --limit "$[[ inputs.target_hosts ]]" \
+        --tags "update" \
+        --extra-vars "{
+          run_update: $[[ inputs.run_update ]],
+          update_type: \"$[[ inputs.update_type ]]\",
+          vault_nexus_username: \"${VAULT_NEXUS_USERNAME}\",
+          vault_nexus_password: \"${VAULT_NEXUS_PASSWORD}\"
+        }"
+  artifacts:
+    paths: [logs/, reports/]
+  rules:
+    - when: manual
+
+report:
+  stage: report
+  extends: .ansible_job
+  needs: [update]
+  script:
+    - |
+      ansible-playbook site.yml \
+        -i inventory/$[[ inputs.inventory ]]/hosts.yml \
+        --limit "$[[ inputs.target_hosts ]]" \
+        --tags "report" \
+        --extra-vars "run_report=$[[ inputs.run_report ]]"
+  artifacts:
+    name: "os-update-report-$CI_PIPELINE_ID"
+    paths: [reports/, logs/]
+    expire_in: 90 days
+  rules:
+    - when: on_success
+```
+
+---
+
+## 5. Изменения в `site.yml`
+
+Добавьте роль Nexus **перед** pre-check (если репозитории ещё не настроены на хосте):
+
+```yaml
+  roles:
+    - role: nexus_repo
+      tags: [nexus, precheck]
+      when: configure_nexus_repo | default(false) | bool
+
+    - role: pre_check_repos
+      tags: [precheck, precheck_repos]
+      ...
+```
+
+Обычно `configure_nexus_repo=false` — репозитории уже настроены; pre-check только проверяет. Для новых серверов — `true`.
+
+---
+
+## 6. Схема потока данных
+
+```mermaid
+flowchart LR
+  subgraph GitLab
+    P[Pipeline Run]
+  end
+  subgraph RunnerServer["Runner Server"]
+    R[GitLab Runner]
+    D[Docker: ansible-os-update]
+  end
+  subgraph Nexus
+    N1[apt/yum repos :8081]
+    N2[docker registry :8082]
+  end
+  subgraph Targets
+    U[Ubuntu hosts]
+    O[OL9 hosts]
+  end
+
+  P --> R
+  R --> D
+  D -->|pull image| N2
+  D -->|SSH ansible| U
+  D -->|SSH ansible| O
+  U -->|apt update| N1
+  O -->|dnf update| N1
+  D -->|artifacts logs/reports| P
+```
+
+---
+
+## 7. Чеклист внедрения
+
+1. Создать apt/yum proxy/group в Nexus + пользователя `ansible-ci`
+2. Создать docker hosted repo `docker-ansible`
+3. Собрать и запушить образ: `./docker/build-push.sh v1.0.0`
+4. Установить GitLab Runner на отдельный сервер с тегами `ansible,os-update,nexus`
+5. Добавить CI Variables: Nexus, Vault, SSH key
+6. Зашифровать секреты в `group_vars/vault.yml` через Ansible Vault
+7. Тест: pipeline с `check_mode=true`, только `precheck`
+
+---
+
+Чтобы я **создал эти файлы в репозитории**, переключитесь в **Agent mode** и укажите:
+- URL Nexus (`host:port`, имена репозиториев),
+- адрес GitLab,
+- путь для проекта (например `~/Projects/linux-os-update`).
+
+Могу также адаптировать шаблоны под ваши точные имена Nexus-репозitoriev из `ans_role_nexus_auth_ol.md` / `migrate_repo`.
+
 - обновление через **internal mirror** или публичные репозитории?
 - нужен ли **автоматический reboot** после обновления?
