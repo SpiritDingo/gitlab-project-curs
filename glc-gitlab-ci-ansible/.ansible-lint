@@ -1,0 +1,23 @@
+---
+# https://ansible.readthedocs.io/projects/lint/configuring/
+
+profile: production
+
+exclude_paths:
+  - .cache/
+  - .venv/
+  - ci/
+  - logs/
+
+skip_list:
+  - schema[playbook]
+  - name[play]
+
+warn_list:
+  - experimental
+  - role-name
+
+enable_list:
+  - no-changed-when
+  - no-handler
+  - no-jinja-when

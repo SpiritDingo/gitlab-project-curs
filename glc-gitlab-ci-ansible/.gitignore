@@ -1,0 +1,31 @@
+# Ansible
+*.retry
+.vault_pass
+.vault_pass.py
+*.pyc
+__pycache__/
+.ansible/
+
+# CI logs (generated at runtime, kept as artifacts)
+logs/*.log
+
+# Python
+.venv/
+.cache/
+*.egg-info/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets
+*.pem
+*.key
+id_rsa
+id_ed25519

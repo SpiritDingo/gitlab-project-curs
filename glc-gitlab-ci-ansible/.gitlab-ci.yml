@@ -1,0 +1,19 @@
+stages:
+  - validate
+  - deploy
+
+variables:
+  ANSIBLE_FORCE_COLOR: "1"
+  EXECUTOR: "shell"
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "trigger"
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $VALIDATE_ONLY == "true"
+
+include:
+  - local: ci/templates/validate.yml
+  - local: ci/templates/ansible-run.yml
