@@ -1,1 +1,78 @@
+# Validation jobs for Ansible playbooks and roles
 
+.validate_base:
+  stage: validate
+  variables:
+    ANSIBLE_FORCE_COLOR: "1"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $VALIDATE_ONLY == "true"
+    - if: $CI_PIPELINE_SOURCE == "trigger"
+    - if: $CI_PIPELINE_SOURCE == "web"
+
+validate:shell:
+  extends: .validate_base
+  tags:
+    - ansible-shell
+  script:
+    - ansible --version
+    - |
+      if command -v ansible-lint >/dev/null 2>&1; then
+        ansible-lint --version
+        ansible-lint
+      else
+        echo "ansible-lint not installed on shell runner, skipping"
+      fi
+    - |
+      if command -v yamllint >/dev/null 2>&1; then
+        yamllint -c .yamllint .
+      else
+        echo "yamllint not installed on shell runner, skipping"
+      fi
+    - |
+      for playbook in playbooks/*/playbook.yml; do
+        if [ -f "$playbook" ]; then
+          echo "Syntax check: $playbook"
+          ansible-playbook --syntax-check "$playbook"
+        fi
+      done
+    - |
+      for inv in inventories/*/hosts.yml; do
+        if [ -f "$inv" ]; then
+          echo "Inventory graph: $inv"
+          ansible-inventory -i "$inv" --graph
+        fi
+      done
+
+validate:docker:
+  extends: .validate_base
+  image:
+    name: willhallonline/ansible:2.16-alpine
+    entrypoint: [""]
+  tags:
+    - ansible-docker
+  before_script:
+    - pip install ansible-lint yamllint
+  script:
+    - ansible --version
+    - ansible-lint
+    - yamllint -c .yamllint .
+    - |
+      for playbook in playbooks/*/playbook.yml; do
+        if [ -f "$playbook" ]; then
+          echo "Syntax check: $playbook"
+          ansible-playbook --syntax-check "$playbook"
+        fi
+      done
+    - |
+      for inv in inventories/*/hosts.yml; do
+        if [ -f "$inv" ]; then
+          echo "Inventory graph: $inv"
+          ansible-inventory -i "$inv" --graph
+        fi
+      done
+  rules:
+    - if: $EXECUTOR == "docker"
+      when: on_success
+    - when: never

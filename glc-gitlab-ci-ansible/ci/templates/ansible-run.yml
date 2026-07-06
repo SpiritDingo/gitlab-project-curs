@@ -1,0 +1,192 @@
+# Shared Ansible run templates for shell and docker executors
+
+.ansible_artifacts:
+  artifacts:
+    paths:
+      - logs/
+    expire_in: 30 days
+    when: always
+
+.ansible_before_script:
+  before_script:
+    - bash ci/scripts/run-ansible.sh --prepare
+
+.ansible_run_script:
+  script:
+    - bash ci/scripts/run-ansible.sh --run
+
+.run_ansible_shell:
+  extends:
+    - .ansible_artifacts
+    - .ansible_before_script
+    - .ansible_run_script
+  stage: deploy
+  tags:
+    - ansible-shell
+  variables:
+    EXECUTOR: shell
+
+.run_ansible_docker:
+  extends:
+    - .ansible_artifacts
+    - .ansible_before_script
+    - .ansible_run_script
+  stage: deploy
+  image:
+    name: willhallonline/ansible:2.16-alpine
+    entrypoint: [""]
+  tags:
+    - ansible-docker
+  variables:
+    EXECUTOR: docker
+
+.ansible_run:
+  extends: .run_ansible_shell
+  rules:
+    - if: $EXECUTOR == "docker"
+      when: never
+    - if: $TARGET
+      when: manual
+    - if: $CI_PIPELINE_SOURCE == "trigger"
+      when: manual
+    - when: manual
+  allow_failure: false
+
+.ansible_run_docker:
+  extends: .run_ansible_docker
+  rules:
+    - if: $EXECUTOR == "docker"
+      when: manual
+    - when: never
+  allow_failure: false
+
+# Playbook jobs — shell executor (default)
+deploy:deploy-web:
+  extends: .ansible_run
+  variables:
+    TARGET: deploy-web
+    PLAYBOOK: playbooks/deploy-web/playbook.yml
+    INVENTORY: project-web
+    EXECUTOR: shell
+  rules:
+    - if: $TARGET == "deploy-web"
+      when: manual
+    - if: $CI_PIPELINE_SOURCE == "trigger" && $TARGET == "deploy-web"
+      when: manual
+    - when: manual
+      allow_failure: true
+
+deploy:deploy-db:
+  extends: .ansible_run
+  variables:
+    TARGET: deploy-db
+    PLAYBOOK: playbooks/deploy-db/playbook.yml
+    INVENTORY: project-db
+    EXECUTOR: shell
+  rules:
+    - if: $TARGET == "deploy-db"
+      when: manual
+    - if: $CI_PIPELINE_SOURCE == "trigger" && $TARGET == "deploy-db"
+      when: manual
+    - when: manual
+      allow_failure: true
+
+# Playbook jobs — docker executor
+deploy:deploy-web:docker:
+  extends: .ansible_run_docker
+  variables:
+    TARGET: deploy-web
+    PLAYBOOK: playbooks/deploy-web/playbook.yml
+    INVENTORY: project-web
+    EXECUTOR: docker
+  rules:
+    - if: $EXECUTOR == "docker" && $TARGET == "deploy-web"
+      when: manual
+    - when: never
+
+deploy:deploy-db:docker:
+  extends: .ansible_run_docker
+  variables:
+    TARGET: deploy-db
+    PLAYBOOK: playbooks/deploy-db/playbook.yml
+    INVENTORY: project-db
+    EXECUTOR: docker
+  rules:
+    - if: $EXECUTOR == "docker" && $TARGET == "deploy-db"
+      when: manual
+    - when: never
+
+# Role jobs — shell executor
+role:nginx:
+  extends: .ansible_run
+  variables:
+    TARGET: role-nginx
+    ROLE: nginx
+    INVENTORY: project-web
+    EXECUTOR: shell
+  rules:
+    - if: $TARGET == "role-nginx"
+      when: manual
+    - if: $ROLE == "nginx"
+      when: manual
+    - when: manual
+      allow_failure: true
+
+role:postgresql:
+  extends: .ansible_run
+  variables:
+    TARGET: role-postgresql
+    ROLE: postgresql
+    INVENTORY: project-db
+    EXECUTOR: shell
+  rules:
+    - if: $TARGET == "role-postgresql"
+      when: manual
+    - if: $ROLE == "postgresql"
+      when: manual
+    - when: manual
+      allow_failure: true
+
+# Role jobs — docker executor
+role:nginx:docker:
+  extends: .ansible_run_docker
+  variables:
+    TARGET: role-nginx
+    ROLE: nginx
+    INVENTORY: project-web
+    EXECUTOR: docker
+  rules:
+    - if: $EXECUTOR == "docker" && ($TARGET == "role-nginx" || $ROLE == "nginx")
+      when: manual
+    - when: never
+
+role:postgresql:docker:
+  extends: .ansible_run_docker
+  variables:
+    TARGET: role-postgresql
+    ROLE: postgresql
+    INVENTORY: project-db
+    EXECUTOR: docker
+  rules:
+    - if: $EXECUTOR == "docker" && ($TARGET == "role-postgresql" || $ROLE == "postgresql")
+      when: manual
+    - when: never
+
+# Generic manual run with any playbook/role via variables
+manual:run:
+  extends: .ansible_run
+  variables:
+    EXECUTOR: shell
+  rules:
+    - if: $MANUAL_RUN == "true"
+      when: manual
+    - when: never
+
+manual:run:docker:
+  extends: .ansible_run_docker
+  variables:
+    EXECUTOR: docker
+  rules:
+    - if: $MANUAL_RUN == "true" && $EXECUTOR == "docker"
+      when: manual
+    - when: never

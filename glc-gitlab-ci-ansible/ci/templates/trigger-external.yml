@@ -1,0 +1,70 @@
+# Template for external GitLab projects to trigger Ansible pipelines.
+# Include from another project:
+#
+#   include:
+#     - project: infrastructure/gitlab_ansible
+#       ref: main
+#       file: ci/templates/trigger-external.yml
+#
+# Required CI/CD variables in the calling project:
+#   ANSIBLE_PROJECT_PATH  — path to gitlab_ansible project (default: infrastructure/gitlab_ansible)
+#   ANSIBLE_TARGET        — TARGET value (e.g. deploy-web, role-nginx)
+#   ANSIBLE_BRANCH        — branch to run (default: main)
+
+.trigger_ansible_base:
+  stage: deploy
+  variables:
+    ANSIBLE_PROJECT_PATH: "infrastructure/gitlab_ansible"
+    ANSIBLE_BRANCH: "main"
+    EXECUTOR: "shell"
+
+trigger:ansible:deploy-web:
+  extends: .trigger_ansible_base
+  trigger:
+    project: $ANSIBLE_PROJECT_PATH
+    branch: $ANSIBLE_BRANCH
+    strategy: depend
+  variables:
+    TARGET: "deploy-web"
+    EXECUTOR: "shell"
+  rules:
+    - if: $ANSIBLE_TARGET == "deploy-web"
+      when: manual
+    - when: never
+
+trigger:ansible:deploy-db:
+  extends: .trigger_ansible_base
+  trigger:
+    project: $ANSIBLE_PROJECT_PATH
+    branch: $ANSIBLE_BRANCH
+    strategy: depend
+  variables:
+    TARGET: "deploy-db"
+    EXECUTOR: "shell"
+  rules:
+    - if: $ANSIBLE_TARGET == "deploy-db"
+      when: manual
+    - when: never
+
+trigger:ansible:custom:
+  extends: .trigger_ansible_base
+  trigger:
+    project: $ANSIBLE_PROJECT_PATH
+    branch: $ANSIBLE_BRANCH
+    strategy: depend
+  variables:
+    TARGET: $ANSIBLE_TARGET
+    EXECUTOR: $EXECUTOR
+    PLAYBOOK: $PLAYBOOK
+    ROLE: $ROLE
+    INVENTORY: $INVENTORY
+    TAGS: $TAGS
+    SKIP_TAGS: $SKIP_TAGS
+    LIMIT: $LIMIT
+    EXTRA_VARS: $EXTRA_VARS
+    CHECK_MODE: $CHECK_MODE
+    MANUAL_RUN: "true"
+  rules:
+    - if: $ANSIBLE_TARGET
+      when: manual
+    - when: never
