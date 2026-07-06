@@ -1,1 +1,10 @@
-
+name: nginx
+type: role
+inventory: project-web
+default_executor: shell
+allowed_executors:
+  - shell
+  - docker
+tags:
+  - web
+  - nginx
