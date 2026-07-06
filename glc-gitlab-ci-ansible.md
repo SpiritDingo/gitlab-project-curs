@@ -64,7 +64,7 @@ flowchart TB
 
 ## Структура репозитория
 
-Создать в [`/home/spiritd/Документы/gitlab_ansible`](/home/spiritd/Документы/gitlab_ansible):
+Создать в [`/home/user/project/gitlab_ansible`](/home/user/project/gitlab_ansible):
 
 ```
 gitlab_ansible/
