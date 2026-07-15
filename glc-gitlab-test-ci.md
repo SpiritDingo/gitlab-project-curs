@@ -354,3 +354,226 @@ second:
 
 **Важное замечание из кода:**
 В строках 64-65 есть жесткая привязка `LIMIT: "devupsen"`. Убедитесь, что в вашем инвентарном файле Ansible есть группа или хост с именем `devupsen`. Иначе первый же плейбук (`docker`) не найдет, на что ему устанавливаться.
+----------------------------------------------
+----------------------------------------------
+
+
+Мы переработали проект под **shell runner** с тегом `ansible-server`, полностью исключив Docker.  
+Все задачи выполняются напрямую на сервере, где уже установлены Ansible, `ansible-lint`, `git`, `ssh-agent` и необходимые зависимости.
+
+### Основные изменения
+- Убран параметр `image` во всех job’ах.
+- Добавлен тег `tags: [ansible-server]` для каждой job’ы, чтобы она назначалась на нужный раннер.
+- Логика работы с SSH-ключом и артефактами остаётся прежней, но выполняется локально.
+- Стадии и ручной выбор типа сохранены полностью.
+
+## 1. `.gitlab-ci.yml`
+
+```yaml
+stages:
+  - type
+  - prepare
+  - lint
+  - infra
+  - bootstrap
+  - gitlab
+  - balancers
+
+variables:
+  ANSIBLE_CONFIG: "./ansible.cfg"
+  PLAYBOOK: "playbooks/test.yml"
+  LIMIT: "all"
+  EXTRAVARS: "empty=true"
+  TAGS: "all"
+
+# ------------------------------------------------------------
+# Шаблоны
+# ------------------------------------------------------------
+
+# Шаблон запуска Ansible-плейбуков (shell runner)
+.run-playbook:
+  tags:
+    - ansible-server
+  before_script:
+    - export ANSIBLE_CONFIG=./ansible.cfg
+    - eval $(ssh-agent -s)
+    - echo "$SSH_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+  script:
+    - echo "Запуск плейбука: $PLAYBOOK"
+    - ansible-playbook playbooks/$PLAYBOOK -l $LIMIT -e "$EXTRAVARS" -t $TAGS
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+      when: manual
+
+# Заглушка для выбора типа деплоя
+.register-type:
+  stage: type
+  tags:
+    - ansible-server
+  script: echo "CHOOSE TYPE: $CI_JOB_NAME"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+      when: manual
+
+# ------------------------------------------------------------
+# Стадия подготовки: загрузка Ansible-ролей из отдельного репо
+# ------------------------------------------------------------
+prepare_roles:
+  stage: prepare
+  tags:
+    - ansible-server
+  script:
+    # Подстановка CI_JOB_TOKEN (shell runner, используем sed)
+    - sed "s|\${CI_JOB_TOKEN}|${CI_JOB_TOKEN}|g" requirements.yml > requirements_resolved.yml
+    - ansible-galaxy install -r requirements_resolved.yml -p roles/ --force
+  artifacts:
+    paths:
+      - roles/
+    expire_in: 1 hour
+
+# ------------------------------------------------------------
+# Линтер Ansible (только на merge requests)
+# ------------------------------------------------------------
+ansible-linter:
+  stage: lint
+  tags:
+    - ansible-server
+  script:
+    - ansible-lint
+  needs:
+    - prepare_roles
+  only:
+    - merge_requests
+
+# ------------------------------------------------------------
+# Ручные джобы-селекторы (stage: type)
+# ------------------------------------------------------------
+infra:
+  extends: .register-type
+
+bootstrap:
+  extends: .register-type
+
+gitlab:
+  extends: .register-type
+
+balancers:
+  extends: .register-type
+
+# ------------------------------------------------------------
+# Задачи деплоя (зависят от выбранного типа и ролей)
+# ------------------------------------------------------------
+
+# Установка Docker (хотя Docker не используется, оставим как пример)
+docker:
+  stage: bootstrap
+  extends: .run-playbook
+  needs:
+    - job: bootstrap
+      artifacts: false
+    - job: prepare_roles
+      artifacts: true
+  variables:
+    PLAYBOOK: "docker.yaml"
+    LIMIT: "devupsen"
+
+# Установка GitLab Runner
+runner:
+  stage: gitlab
+  extends: .run-playbook
+  needs:
+    - job: gitlab
+      artifacts: false
+    - job: prepare_roles
+      artifacts: true
+  variables:
+    PLAYBOOK: "gitlab-runner.yaml"
+
+# Настройка Vault и Postgres
+vault:
+  stage: infra
+  extends: .run-playbook
+  needs:
+    - job: infra
+      artifacts: false
+    - job: prepare_roles
+      artifacts: true
+  variables:
+    PLAYBOOK: "vault.yaml"
+    EXTRAVARS: 'postgres_vault.password="$VAULT_POSTGRES_PASSWORD"'
+
+# Основной балансировщик (Зелёный/Жёлтый)
+main:
+  stage: balancers
+  extends: .run-playbook
+  needs:
+    - job: balancers
+      artifacts: false
+    - job: prepare_roles
+      artifacts: true
+  variables:
+    PLAYBOOK: "nginx.yaml"
+    LIMIT: "balancer-green.devupsen.ru,balancer-yellow.devupsen.ru"
+    TAGS: "main"
+
+# Резервный балансировщик (Красный)
+second:
+  stage: balancers
+  extends: .run-playbook
+  needs:
+    - job: balancers
+      artifacts: false
+    - job: prepare_roles
+      artifacts: true
+  variables:
+    PLAYBOOK: "nginx.yaml"
+    LIMIT: "balancer-red.devupsen.ru"
+    TAGS: "backup-node,main"
+```
+
+## 2. Требования к серверу-раннеру (ansible-server)
+
+На сервере, где запущен GitLab Runner с executor **shell** и тегом `ansible-server`, должны быть установлены:
+
+- **Ansible** (рекомендуется версия, совместимая с вашими плейбуками, например, `ansible >= 2.9`)
+- **ansible-lint** (для стадии lint)
+- **git**
+- **openssh-client** и **ssh-agent**
+- **Python** (обычно уже есть)
+
+Дополнительно:
+- В переменных GitLab CI/CD должны быть заданы `SSH_KEY` (приватный ключ для доступа к целевым хостам) и, при необходимости, другие секреты (`VAULT_POSTGRES_PASSWORD` и т.п.).
+- `CI_JOB_TOKEN` доступен автоматически.
+
+## 3. Структура проекта (без Docker)
+
+Проект сохраняет ту же файловую структуру, что и раньше, за исключением отсутствия Dockerfile и упоминаний Docker:
+
+```
+ansible-playbooks/
+├── .gitlab-ci.yml
+├── requirements.yml
+├── ansible.cfg
+├── .ansible-lint
+├── playbooks/
+│   └── ... (ваши плейбуки docker.yaml, gitlab-runner.yaml и т.д.)
+├── inventory/
+│   ├── staging.yml
+│   ├── production.yml
+│   └── ...
+├── roles/          # будет заполнена через ansible-galaxy
+└── README.md
+```
+
+## 4. Пример `requirements.yml`
+
+```yaml
+- src: https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.example.com/group/ansible-roles.git
+  scm: git
+  version: main
+  name: my_role
+```
+
+Теперь пайплайн полностью выполняется на выделенном сервере без Docker, роли подтягиваются из отдельного репозитория, а ручной выбор типа деплоя сохранён.
